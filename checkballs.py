@@ -25,6 +25,7 @@ import time
 import urllib.parse
 import urllib.request
 import zlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 
 from mitmproxy import ctx, http
@@ -37,6 +38,8 @@ TARGET_COMMAND = "F11129"
 OUTPUT_FILE = "full_list.json"
 DEBUG_RAW_FILE = "debug_page0_raw.txt"
 DEBUG_JSON_FILE = "debug_page0_parsed.json"
+
+CONCURRENCY = 8
 
 
 def safe_json_loads(s: str):
@@ -127,9 +130,8 @@ def dump_debug_files(raw_text: str, obj):
         pass
 
 
-def http_get_bytes(url: str, headers: dict, timeout: int = 20) -> bytes:
-    """发起 HTTP 请求，返回原始响应字节（不做任何解码，自动解压 Content-Encoding）。"""
-    # 告知服务器我们接受 gzip/deflate 压缩
+def http_get_text(url: str, headers: dict, timeout: int = 20) -> str:
+    """发起 HTTP GET 请求，自动处理 gzip/deflate 压缩，返回解码后的文本。"""
     req_headers = dict(headers)
     req_headers["Accept-Encoding"] = "gzip, deflate"
 
@@ -157,17 +159,10 @@ def http_get_bytes(url: str, headers: dict, timeout: int = 20) -> bytes:
                 except Exception:
                     pass
 
-        return raw_data
-
-
-def http_get_text(url: str, headers: dict, timeout: int = 20) -> str:
-    """发起 HTTP 请求，返回解压并解码后的文本。"""
-    raw_data = http_get_bytes(url, headers=headers, timeout=timeout)
-    # 尝试 utf-8，失败则降级到 latin-1（latin-1 永远不会抛异常）
-    try:
-        return raw_data.decode("utf-8")
-    except UnicodeDecodeError:
-        return raw_data.decode("latin-1")
+        try:
+            return raw_data.decode("utf-8")
+        except UnicodeDecodeError:
+            return raw_data.decode("latin-1")
 
 
 class FullFetcher:
@@ -222,6 +217,68 @@ class FullFetcher:
         self.running = True
         threading.Thread(target=self.fetch_all_from_flow, args=(flow,), daemon=True).start()
 
+    def _build_url(self, parsed, outer_params, base_inner, page_idx):
+        """构造指定页码的完整 URL。"""
+        current_inner = deepcopy(base_inner)
+        current_inner["pageindex"] = str(page_idx)
+
+        current_outer = deepcopy(outer_params)
+        current_outer["command"] = rebuild_inner_command(current_inner)
+        if "t" in current_outer:
+            current_outer["t"] = str(int(time.time() * 1000))
+
+        return urllib.parse.urlunparse(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                parsed.params,
+                urllib.parse.urlencode(current_outer),
+                parsed.fragment,
+            )
+        )
+
+    def _fetch_one_page(self, url, headers, page_num):
+        """拉取单页，返回 (page_num, page_rows, has_next_page) 或失败信息。"""
+        max_retries = 3
+        for retry in range(max_retries):
+            try:
+                text = http_get_text(url, headers=headers, timeout=20).strip()
+                obj = extract_json_payload(text)
+                if obj is None:
+                    l, r = text.find("{"), text.rfind("}")
+                    if l != -1 and r != -1 and r > l:
+                        obj = safe_json_loads(text[l : r + 1])
+                if obj:
+                    break
+                if retry < max_retries - 1:
+                    time.sleep(0.5)
+            except Exception:
+                if retry < max_retries - 1:
+                    time.sleep(0.5)
+
+        if not obj:
+            return page_num, None, False
+
+        resultinfo = normalize_resultinfo(obj.get("resultinfo", {}))
+        entries = resultinfo.get("list", [])
+
+        page_rows = []
+        has_next_page = False
+        th = None
+
+        for entry in entries:
+            data = decode_url_json(entry.get("data", ""))
+            th_entry = decode_url_json(entry.get("table_head", ""))
+            if isinstance(data, list):
+                page_rows.extend(data)
+            if th_entry and th is None:
+                th = th_entry
+            if str(entry.get("has_next_page", "0")) == "1":
+                has_next_page = True
+
+        return page_num, page_rows, has_next_page, th
+
     def fetch_all_from_flow(self, flow: http.HTTPFlow):
         try:
             req = flow.request
@@ -232,11 +289,10 @@ class FullFetcher:
             command_outer = outer_params.get("command", "")
             inner_params = parse_inner_command(command_outer)
 
-            self.log(f"正在获取道具流水...")
+            self.log("正在获取道具流水...")
 
             base_inner = deepcopy(inner_params)
-            pageindex = int(base_inner.get("pageindex", "0"))
-            pagesize = int(base_inner.get("pagesize", "15"))
+            start_page = int(base_inner.get("pageindex", "0"))
 
             headers = dict(req.headers)
             headers.pop("Content-Length", None)
@@ -246,118 +302,102 @@ class FullFetcher:
 
             all_rows = []
             table_head = None
+            next_page = start_page
+            empty_streak = 0
+            dup_streak = 0
             max_pages = 2000
-            empty_page_streak = 0
-            duplicate_page_streak = 0
+            fetched = 0
 
-            for i in range(max_pages):
-                current_inner = deepcopy(base_inner)
-                current_inner["pageindex"] = str(pageindex + i)
-                current_inner["pagesize"] = str(pagesize)
+            with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+                while fetched < max_pages:
+                    # 计算本批要拉取的页码
+                    batch_size = min(CONCURRENCY, max_pages - fetched)
+                    batch_pages = list(range(next_page, next_page + batch_size))
 
-                current_outer = deepcopy(outer_params)
-                current_outer["command"] = rebuild_inner_command(current_inner)
-                if "t" in current_outer:
-                    current_outer["t"] = str(int(time.time() * 1000))
+                    # 构造 URL 并提交
+                    futures = {}
+                    for p in batch_pages:
+                        url = self._build_url(parsed, outer_params, base_inner, p)
+                        futures[pool.submit(self._fetch_one_page, url, headers, p)] = p
 
-                url = urllib.parse.urlunparse(
-                    (
-                        parsed.scheme,
-                        parsed.netloc,
-                        parsed.path,
-                        parsed.params,
-                        urllib.parse.urlencode(current_outer),
-                        parsed.fragment,
+                    # 收集结果
+                    batch_results = []
+                    for future in as_completed(futures):
+                        result = future.result()
+                        batch_results.append(result)
+
+                    # 按页码排序处理
+                    batch_results.sort(key=lambda r: r[0])
+
+                    any_empty = False
+                    any_dup = False
+                    for result in batch_results:
+                        page_num = result[0]
+                        page_rows = result[1]
+                        has_next = result[2]
+                        th = result[3] if len(result) > 3 else None
+
+                        if page_rows is None:
+                            # 请求失败
+                            any_empty = True
+                            continue
+
+                        if th and table_head is None:
+                            table_head = th
+
+                        before = len(all_rows)
+                        all_rows.extend(page_rows)
+                        all_rows = dedupe_rows(all_rows)
+                        added = len(all_rows) - before
+
+                        if fetched + batch_pages.index(page_num) < len(batch_pages):
+                            pass  # 日志在下面统一输出
+
+                        if not page_rows:
+                            any_empty = True
+                        if page_rows and added == 0:
+                            any_dup = True
+
+                        fetched += 1
+
+                    # 日志：只显示本批中非空的最后一条
+                    last_valid = None
+                    for result in batch_results:
+                        pn = result[0]
+                        pr = result[1]
+                        if pr is not None:
+                            last_valid = (pn, len(all_rows))
+
+                    if last_valid:
+                        self.log(
+                            f"page {fetched} 当前 {len(all_rows)}条"
+                        )
+
+                    next_page += batch_size
+
+                    # 判断终止条件
+                    all_empty = all(
+                        (r[1] is None or len(r[1]) == 0) for r in batch_results
                     )
-                )
+                    if all_empty:
+                        empty_streak += 1
+                    else:
+                        empty_streak = 0
 
-                self.log(f"[fetch] 拉取 pageindex={current_inner['pageindex']}")
+                    if any_empty and not any_dup:
+                        dup_streak = 0
+                    elif any_dup:
+                        dup_streak += 1
+                    else:
+                        dup_streak = 0
 
-                # 重试机制
-                max_retries = 3
-                obj = None
-                text = ""
+                    if empty_streak >= 2:
+                        self.log("[done] 连续 2 批为空，获取完成")
+                        break
 
-                for retry in range(max_retries):
-                    try:
-                        text = http_get_text(url, headers=headers, timeout=20).strip()
-                        obj = extract_json_payload(text)
-
-                        if obj is None:
-                            l = text.find("{")
-                            r = text.rfind("}")
-                            if l != -1 and r != -1 and r > l:
-                                obj = safe_json_loads(text[l : r + 1])
-
-                        if obj:
-                            break
-
-                        if retry < max_retries - 1:
-                            self.log(f"[warn] 第 {retry + 1} 次解析失败，1 秒后重试...")
-                            time.sleep(1)
-
-                    except Exception as e:
-                        if retry < max_retries - 1:
-                            self.log(f"[warn] 第 {retry + 1} 次请求异常: {e}，1 秒后重试...")
-                            time.sleep(1)
-                        else:
-                            self.log(f"[error] 请求失败: {e}")
-
-                if not obj:
-                    self.log(f"[error] JSON 解析失败，前 300 字符: {text[:300] if text else '空响应'}")
-                    break
-
-                resultinfo = obj.get("resultinfo", {})
-                entries = resultinfo.get("list", [])
-
-                page_rows = []
-                has_next_page = False
-
-                for entry in entries:
-                    data = decode_url_json(entry.get("data", ""))
-                    th = decode_url_json(entry.get("table_head", ""))
-
-                    if isinstance(data, list):
-                        page_rows.extend(data)
-
-                    if th and table_head is None:
-                        table_head = th
-
-                    if str(entry.get("has_next_page", "0")) == "1":
-                        has_next_page = True
-
-                before = len(all_rows)
-                all_rows.extend(page_rows)
-                all_rows = dedupe_rows(all_rows)
-                added = len(all_rows) - before
-
-                self.log(
-                    f"page {i + 1} +{added}条 当前 {len(all_rows)}条  "
-                    f"has_next={1 if has_next_page else 0}"
-                )
-
-                if not page_rows:
-                    empty_page_streak += 1
-                else:
-                    empty_page_streak = 0
-
-                if page_rows and added == 0:
-                    duplicate_page_streak += 1
-                else:
-                    duplicate_page_streak = 0
-
-                if empty_page_streak >= 2:
-                    self.log("[done] 连续 2 页为空，停止继续翻页")
-                    break
-
-                if duplicate_page_streak >= 3:
-                    self.log("[done] 连续 3 页没有新增记录，疑似到达末尾，停止继续翻页")
-                    break
-
-                if not has_next_page:
-                    self.log("[hint] has_next_page=0，但继续探测后续页，直到空页或重复页为止")
-
-                time.sleep(0.25)
+                    if dup_streak >= 2:
+                        self.log("[done] 连续 2 批没有新增记录，获取完成")
+                        break
 
             out = {
                 "count": len(all_rows),
