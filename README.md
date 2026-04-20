@@ -12,6 +12,8 @@
 
 ## 使用方法
 
+确保你 **安装并信任了 mitmproxy 证书**
+
 ```bash
 pip install mitmproxy
 python checkballs.py
