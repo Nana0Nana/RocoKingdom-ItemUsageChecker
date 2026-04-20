@@ -1,5 +1,5 @@
-# RocoKingdom-ItemUsageChecker
-通过mitmproxy进行中间人代理并自动抓取游戏客服中心「道具流水」数据，并生成可视化筛选页面。
+# RocoKingdom-ItemUsageChecker 洛克王国：世界 道具流水查询器
+通过mitmproxy进行中间人代理并自动抓取洛克王国：世界游戏客服中心「道具流水」数据，并生成可视化筛选页面。
 自动获取道具流水并统计精灵球用量
 
 ## 功能
@@ -40,4 +40,6 @@ python checkballs.py
 - 自动处理 gzip/deflate 压缩响应
 - 退出时自动恢复原始代理设置
 - 100% VibeCoding （AI真的太好用了你知道吗）
+
+# 粉星仔异色吃我4000多球，一气之下写此工具。
 
