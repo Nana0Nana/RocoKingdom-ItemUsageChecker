@@ -4,7 +4,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>流水筛选可视化 - 高级数据终端</title>
+  <title>可视化道具流水</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Noto+Sans+SC:wght@300;400;500;700;800&display=swap" rel="stylesheet">
@@ -565,8 +565,8 @@
 
   <div class="wrap">
     <header class="glass-panel hero">
-      <h1>流水筛选可视化</h1>
-      <p class="sub">查看固定时间段、固定道具种类、增减类型和原因过滤，并把结果用汇总卡片、排行榜和明细表现代化展示。</p>
+      <h1>道具流水可视化</h1>
+      <p class="sub">可查看固定时间段、固定道具种类的增减类型和原因。</p>
     </header>
 
     <div class="summary-grid">
@@ -594,7 +594,7 @@
         <section class="glass-panel">
           <h2>数据源</h2>
           <div class="actions">
-            <button id="loadDefaultBtn" class="btn-primary" type="button">加载同目录 JSON</button>
+            <button id="loadDefaultBtn" class="btn-primary" type="button">加载道具流水JSON</button>
             <div class="file-input-wrapper">
               <label class="btn-secondary file-button" for="fileInput" style="margin: 0; padding: 12px 24px;">手动选择 JSON</label>
               <input id="fileInput" type="file" accept=".json,application/json">
@@ -809,7 +809,7 @@
 
     async function loadDefaultFile(silentRetry = false) {
       if (!silentRetry) {
-        setStatus("正在尝试读取同目录 full_list.json ...");
+        setStatus("正在尝试读取同目录文件 ...");
       }
       try {
         const response = await fetch("./full_list.json?ts=" + Date.now());
@@ -817,7 +817,7 @@
           throw new Error("HTTP " + response.status);
         }
         const data = await response.json();
-        hydrateData(data, "已加载同目录 full_list.json");
+        hydrateData(data, "已加载同目录下文件");
       } catch (error) {
         setStatus("自动读取失败，请改用“手动选择 JSON”。原因：" + error.message);
         scheduleAutoLoadRetry();
